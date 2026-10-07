@@ -23,6 +23,10 @@ import java.util.Random;
  *       重复请求返回首次结论且不二次应用，内容冲突以 {@link SubmitResult.Status#IDEMPOTENCY_CONFLICT} 拒绝；</li>
  *   <li><b>日志复制与故障恢复</b>：提交前持久化，仅多数派提交的条目应用到状态机；
  *       按快照 + 快照后日志恢复，未提交条目保留但永不生效；分歧由 AppendEntries 一致性检查截断修复。</li>
+ *   <li><b>落后副本追赶</b>：跟随者的同步位置落入领导快照边界之内（其缺失历史已被压缩）时，
+ *       领导改发 InstallSnapshot 把已提交状态整体推送，跟随者据此重建并从边界继续增量复制；
+ *       推送幂等可重复、可在领导/跟随者重启后续传，且拒绝不新于本地提交进度的旧快照，
+ *       已更新副本绝不会被旧内容覆盖。</li>
  * </ul>
  */
 public class RaftNode {
@@ -83,6 +87,8 @@ public class RaftNode {
     private final Deque<Directed> inbox = new ArrayDeque<>();
     private final Deque<Envelope> outbox = new ArrayDeque<>();
     private boolean up = true;
+    /** 测试钩子：暂停选举计时（用于只黑入站消息、但不想让该节点发起选举的场景）。 */
+    private boolean electionTimerPaused = false;
 
     public RaftNode(String nodeId, NodeStorage storage, int electionTimeoutMin,
                     int electionTimeoutRange, int heartbeatInterval,
@@ -111,7 +117,12 @@ public class RaftNode {
 
         this.snapshot = storage.loadSnapshot();
         this.log.clear();
-        this.log.addAll(storage.loadLog());
+        // 防御：只接受严格位于快照边界之后的日志（边界内条目已在快照中，保留会造成位置错位）
+        for (LogEntry entry : storage.loadLog()) {
+            if (entry.getIndex() > snapshot.getLastIncludedIndex()) {
+                log.add(entry);
+            }
+        }
 
         this.stateMachine.resetFrom(snapshot.getKv());
         this.idempotency.clear();
@@ -152,6 +163,18 @@ public class RaftNode {
 
     public long lastLogTerm() {
         return log.isEmpty() ? snapshot.getLastIncludedTerm() : log.get(log.size() - 1).getTerm();
+    }
+
+    /** 当前快照（压缩）边界下标；落后者的同步位置落入该边界之内时需要 InstallSnapshot 追赶。 */
+    public long getSnapshotIndex() {
+        return snapshot.getLastIncludedIndex();
+    }
+
+    /** 当前快照内容的防御性副本（测试用：构造"迟到的旧快照"验证防旧覆盖）。 */
+    public Snapshot snapshotCopy() {
+        return new Snapshot(snapshot.getLastIncludedIndex(), snapshot.getLastIncludedTerm(),
+                new LinkedHashMap<>(snapshot.getKv()),
+                new LinkedHashMap<>(snapshot.getIdempotency()));
     }
 
     public long getLastLogIndex() { return lastLogIndex(); }
@@ -195,6 +218,22 @@ public class RaftNode {
 
     void deliver(Object message, String from) {
         inbox.addLast(new Directed(message, from));
+    }
+
+    /**
+     * 测试用：直接把一条消息注入本节点收件箱（绕过正常网络路径），
+     * 用于确定性地构造"旧领导迟到的 InstallSnapshot"等边界时序。
+     */
+    void injectMessage(Object message, String from) {
+        deliver(message, from);
+    }
+
+    /** 测试钩子：暂停/恢复跟随者选举计时。 */
+    public void setElectionTimerPaused(boolean paused) {
+        this.electionTimerPaused = paused;
+        if (!paused) {
+            resetElectionTimer();
+        }
     }
 
     boolean hasOutgoing() {
@@ -244,9 +283,11 @@ public class RaftNode {
                 broadcastAppendEntries();
             }
         } else {
-            electionElapsed++;
-            if (electionElapsed >= electionTimeoutTicks) {
-                startElection();
+            if (!electionTimerPaused) {
+                electionElapsed++;
+                if (electionElapsed >= electionTimeoutTicks) {
+                    startElection();
+                }
             }
         }
         drainInbox();
@@ -376,9 +417,16 @@ public class RaftNode {
         long next = nextIndex.getOrDefault(peer, lastLogIndex() + 1);
 
         if (next <= snapshotIndex) {
-            // 落后者需要快照；本实验在测试里通过更紧凑的日志窗口规避，做防御性拒绝提示。
-            System.out.printf("[复制] 节点 %s(领导) 发现 %s 落后于快照边界 %d，需要 InstallSnapshot（本实验不触发）%n",
-                    id, peer, snapshotIndex);
+            // 跟随者缺失的历史已被本节点压缩：日志追加无从对齐 prevLog，
+            // 改用 InstallSnapshot 把快照边界内的已提交状态整体送过去（落后副本追赶）。
+            // 每轮心跳都可重发：快照安装是幂等的（相同边界再次安装结果不变），
+            // 目标宕机导致响应丢失时也不会"卡死"在等待中。
+            System.out.printf("[追赶] 节点 %s(领导) 发现 %s 的同步位置 %d 已落在快照边界 %d 之内，改推快照（term=%d，leaderCommit=%d）%n",
+                    id, peer, next, snapshotIndex, snapshot.getLastIncludedTerm(), commitIndex);
+            outbox.addLast(new Envelope(peer, new RaftMessage.InstallSnapshot(
+                    currentTerm, id,
+                    snapshotIndex, snapshot.getLastIncludedTerm(),
+                    snapshot.getKv(), snapshot.getIdempotency(), commitIndex)));
             return;
         }
 
@@ -487,7 +535,8 @@ public class RaftNode {
             nextIndex.put(from, response.followerLastIndex() + 1);
             advanceLeaderCommit();
         } else {
-            long base = snapshot.getLastIncludedIndex() + 1;
+            // 回退下界允许落到快照边界本身：一旦 next <= 快照边界，下一轮即转 InstallSnapshot。
+            long base = snapshot.getLastIncludedIndex();
             // 跟随者自报其日志末尾：从末尾之后重发，配合 conflictHint 快速定位分歧
             long byFollower = Math.max(base, response.followerLastIndex() + 1);
             long next;
@@ -499,6 +548,113 @@ public class RaftNode {
             nextIndex.put(from, next);
             sendAppendEntries(from);
         }
+    }
+
+    private void handleInstallSnapshot(RaftMessage.InstallSnapshot request, String from) {
+        if (request.term() < currentTerm) {
+            // 旧任期领导者：不安装、不退位
+            outbox.addLast(new Envelope(from,
+                    new RaftMessage.InstallSnapshotResponse(currentTerm, false,
+                            snapshot.getLastIncludedIndex())));
+            return;
+        }
+        if (request.term() > currentTerm) {
+            stepDown(request.term());
+        }
+        role = NodeRole.FOLLOWER;
+        leaderHint = request.leaderId();
+        resetElectionTimer();
+
+        long incomingIndex = request.lastIncludedIndex();
+
+        // 防旧覆盖：快照边界不新于本地已提交进度，说明手上内容已不旧于这份快照
+        // （可能是旧领导迟到的推送，或追赶途中集群又压缩过）。拒绝它，绝不回退状态。
+        if (incomingIndex <= commitIndex) {
+            System.out.printf("[追赶] 节点 %s 拒绝来自 %s 的旧快照（快照边界=%d 已不新于本地提交=%d），本地状态不回退%n",
+                    id, from, incomingIndex, commitIndex);
+            outbox.addLast(new Envelope(from,
+                    new RaftMessage.InstallSnapshotResponse(currentTerm, false,
+                            snapshot.getLastIncludedIndex())));
+            return;
+        }
+
+        long oldSnapshotIndex = snapshot.getLastIncludedIndex();
+        // 若本地恰有边界处的条目且 term 与快照不一致，则边界之后的尾部日志全部丢弃；
+        // 否则保留边界之后严格连续（首条 index==incomingIndex+1）的尾部日志（标准 Raft 规则）。
+        LogEntry atBoundary = entryAt(incomingIndex);
+        boolean discardTail = atBoundary != null && atBoundary.getTerm() != request.lastIncludedTerm();
+        List<LogEntry> retained = new ArrayList<>();
+        if (!discardTail) {
+            for (LogEntry e : log) {
+                if (e.getIndex() > incomingIndex) {
+                    retained.add(e);
+                }
+            }
+            if (retained.isEmpty() || retained.get(0).getIndex() != incomingIndex + 1) {
+                retained.clear();
+            }
+        }
+
+        // 用快照内容整体替换已提交视图
+        Snapshot installed = new Snapshot(incomingIndex, request.lastIncludedTerm(),
+                new LinkedHashMap<>(request.kv()),
+                new LinkedHashMap<>(request.idempotency()));
+        storage.saveSnapshot(installed);
+        log.clear();
+        log.addAll(retained);
+        storage.saveLog(log);
+        snapshot = installed;
+        stateMachine.resetFrom(snapshot.getKv());
+        idempotency.clear();
+        idempotency.putAll(snapshot.getIdempotency());
+        lastApplied = incomingIndex;
+
+        // 快照内状态天然已提交：提交进度至少推进到边界；leaderCommit 更靠前时一并推进，
+        // 但绝不越过本地实际日志末尾（未持有条目不得被标为已提交、更不会被应用）。
+        long newCommit = Math.min(Math.max(request.leaderCommit(), incomingIndex), lastLogIndex());
+        System.out.printf("[追赶] 节点 %s 安装来自领导 %s 的快照：边界 %d/term=%d（原快照边界=%d），保留尾部日志 %d 条，提交推进 %d -> %d%n",
+                id, from, incomingIndex, request.lastIncludedTerm(),
+                oldSnapshotIndex, log.size(), commitIndex, newCommit);
+        commitIndex = newCommit;
+        persistHardState();
+        // 快照本身已整体生效（resetFrom），只需回放边界之后、提交点之前的日志，不重复应用快照内容
+        for (long i = lastApplied + 1; i <= commitIndex; i++) {
+            LogEntry entry = entryAt(i);
+            if (entry != null) {
+                applyCommitted(entry);
+                lastApplied = i;
+            }
+        }
+
+        outbox.addLast(new Envelope(from,
+                new RaftMessage.InstallSnapshotResponse(currentTerm, true, incomingIndex)));
+    }
+
+    private void handleInstallSnapshotResponse(RaftMessage.InstallSnapshotResponse response, String from) {
+        if (response.term() > currentTerm) {
+            stepDown(response.term());
+            return;
+        }
+        if (role != NodeRole.LEADER || response.term() != currentTerm) {
+            return;
+        }
+        if (!response.success()) {
+            // 跟随者拒绝（例如该快照比它已提交进度还旧）：跟随者手上内容更新，
+            // 让 nextIndex 从其当前进度之后继续，由下一轮增量复制对齐。
+            System.out.printf("[追赶] 节点 %s(领导) 推送快照给 %s 被拒绝（快照边界=%d），跟随者内容更新，改走增量探测%n",
+                    id, from, response.lastIncludedIndex());
+            long probe = Math.max(response.lastIncludedIndex() + 1, snapshot.getLastIncludedIndex() + 1);
+            nextIndex.put(from, probe);
+            sendAppendEntries(from);
+            return;
+        }
+        long boundary = response.lastIncludedIndex();
+        matchIndex.put(from, Math.max(matchIndex.getOrDefault(from, snapshot.getLastIncludedIndex()), boundary));
+        nextIndex.put(from, boundary + 1);
+        System.out.printf("[追赶] 节点 %s(领导) 确认 %s 已安装快照至 index=%d，改为从 %d 起增量复制%n",
+                id, from, boundary, boundary + 1);
+        advanceLeaderCommit();
+        sendAppendEntries(from);
     }
 
     private void drainInbox() {
@@ -514,6 +670,10 @@ public class RaftNode {
                 handleAppendEntries(ae, from);
             } else if (message instanceof RaftMessage.AppendEntriesResponse aer) {
                 handleAppendEntriesResponse(aer, from);
+            } else if (message instanceof RaftMessage.InstallSnapshot is) {
+                handleInstallSnapshot(is, from);
+            } else if (message instanceof RaftMessage.InstallSnapshotResponse isr) {
+                handleInstallSnapshotResponse(isr, from);
             }
         }
     }

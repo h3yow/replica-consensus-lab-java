@@ -29,6 +29,8 @@ public class RaftCluster {
     private final Map<String, RaftNode> nodes = new LinkedHashMap<>();
     private final Map<String, NodeStorage> storages = new LinkedHashMap<>();
     private final Set<String> partitioned = new HashSet<>();
+    /** 测试用：发往这些节点的消息直接丢弃（比双向分区更轻量，只"黑"一个接收方）。 */
+    private final Set<String> dropIncomingTo = new HashSet<>();
 
     private long tickCount = 0;
 
@@ -109,6 +111,23 @@ public class RaftCluster {
         return !partitioned.contains(linkKey(from, to));
     }
 
+    /** 测试用：丢弃所有发往该节点的入站消息（节点仍在线、仍在 tick，但不主动发起选举）。 */
+    public void blockIncoming(String id) {
+        dropIncomingTo.add(id);
+        nodes.get(id).setElectionTimerPaused(true);
+        System.out.printf("[网络] 丢弃发往 %s 的全部入站消息（测试钩子）%n", id);
+    }
+
+    /** 测试用：恢复对该节点的正常投递与选举计时。 */
+    public void unblockIncoming(String id) {
+        dropIncomingTo.remove(id);
+        RaftNode node = nodes.get(id);
+        if (node.isUp()) {
+            node.setElectionTimerPaused(false);
+        }
+        System.out.printf("[网络] 恢复发往 %s 的入站消息（测试钩子）%n", id);
+    }
+
     // ---------- 故障与重启 ----------
 
     /** 宕机：节点停止一切活动；"磁盘"（storage）保留。 */
@@ -119,6 +138,20 @@ public class RaftCluster {
     /** 用同一份持久化数据重启节点。 */
     public void restart(String id) {
         nodes.get(id).restart(storages.get(id));
+    }
+
+    /**
+     * 测试用：模拟 {@code fromLeader} 的一份 InstallSnapshot 直接投递到 {@code to}
+     * （进程内绕过正常网络），用于确定性构造"旧领导迟到快照"等打断/乱序时序。
+     * 消息在下一次 {@link #tick()} 随收件箱一起被处理。
+     */
+    public void injectInstallSnapshot(String fromLeader, String to, Snapshot snapshot,
+                                     long leaderCommit) {
+        RaftNode leader = nodes.get(fromLeader);
+        nodes.get(to).injectMessage(new RaftMessage.InstallSnapshot(
+                leader.getCurrentTerm(), fromLeader,
+                snapshot.getLastIncludedIndex(), snapshot.getLastIncludedTerm(),
+                snapshot.getKv(), snapshot.getIdempotency(), leaderCommit), fromLeader);
     }
 
     // ---------- 节点访问 ----------
@@ -152,10 +185,13 @@ public class RaftCluster {
             }
         }
 
-        // 阶段二：统一投递，受分区与宕机约束
+        // 阶段二：统一投递，受分区、宕机与测试用入站丢弃约束
         for (SourcedEnvelope envelope : batch) {
             RaftNode target = nodes.get(envelope.to());
             if (target == null || !target.isUp()) {
+                continue;
+            }
+            if (dropIncomingTo.contains(envelope.to())) {
                 continue;
             }
             if (!canDeliver(envelope.from(), envelope.to())) {
@@ -211,6 +247,14 @@ public class RaftCluster {
 
     /** 推进直到所有在线节点的提交下标都达到 leader 的提交下标（日志收敛）。 */
     public boolean waitForConvergence(int maxTicks) {
+        return ticksToConvergence(maxTicks) >= 0;
+    }
+
+    /**
+     * 与 {@link #waitForConvergence(int)} 相同的收敛判定，但返回实际耗费的 tick 数；
+     * 超时返回 -1。用于显式验证"落后副本在合理次数推进内追平"。
+     */
+    public long ticksToConvergence(int maxTicks) {
         for (int i = 0; i < maxTicks; i++) {
             String leaderId = getLeaderId();
             if (leaderId != null) {
@@ -219,12 +263,12 @@ public class RaftCluster {
                         .filter(RaftNode::isUp)
                         .allMatch(n -> n.getCommitIndex() >= leaderCommit);
                 if (allCaughtUp) {
-                    return true;
+                    return i;
                 }
             }
             tick();
         }
-        return false;
+        return -1;
     }
 
     /** 推进直到所有在线节点对某个 key 的已提交状态一致。 */
@@ -243,12 +287,15 @@ public class RaftCluster {
 
     // ---------- 客户端提交 ----------
 
-    /** 自动路由到当前领导者的便捷提交。 */
+    /** 自动路由到当前领导者的便捷提交；尚无领导者时先在超时预算内推进选举。 */
     public SubmitResult submit(String clientId, String requestId, String command, int maxTicks) {
         String target = getLeaderId();
         if (target == null) {
-            return new SubmitResult(SubmitResult.Status.NOT_LEADER, null, -1, null,
-                    "集群当前没有可用领导者");
+            target = runUntilLeaderElected(maxTicks);
+            if (target == null) {
+                return new SubmitResult(SubmitResult.Status.NOT_LEADER, null, -1, null,
+                        "集群当前没有可用领导者（" + maxTicks + " ticks 内未选出）");
+            }
         }
         return submitVia(nodes.get(target), clientId, requestId, command, maxTicks);
     }
