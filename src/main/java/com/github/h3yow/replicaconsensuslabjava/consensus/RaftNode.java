@@ -23,6 +23,8 @@ import java.util.Random;
  *       重复请求返回首次结论且不二次应用，内容冲突以 {@link SubmitResult.Status#IDEMPOTENCY_CONFLICT} 拒绝；</li>
  *   <li><b>日志复制与故障恢复</b>：提交前持久化，仅多数派提交的条目应用到状态机；
  *       按快照 + 快照后日志恢复，未提交条目保留但永不生效；分歧由 AppendEntries 一致性检查截断修复。</li>
+ *   <li><b>落后副本追赶</b>：跟随者落后的起点已被压缩时，领导改用 InstallSnapshot
+ *       整体推送已提交状态（KV + 幂等表），再补齐快照后条目；过期快照不覆盖本地更新状态。</li>
  * </ul>
  */
 public class RaftNode {
@@ -112,6 +114,9 @@ public class RaftNode {
         this.snapshot = storage.loadSnapshot();
         this.log.clear();
         this.log.addAll(storage.loadLog());
+        // 安装快照是"先存快照、再截日志"：若崩溃于两步之间，磁盘日志里会残留
+        // 已被快照覆盖的旧条目，恢复时以快照为准丢弃，保证 lastLogIndex 不回退
+        log.removeIf(e -> e.getIndex() <= snapshot.getLastIncludedIndex());
 
         this.stateMachine.resetFrom(snapshot.getKv());
         this.idempotency.clear();
@@ -157,6 +162,9 @@ public class RaftNode {
     public long getLastLogIndex() { return lastLogIndex(); }
     public long getLastLogTerm() { return lastLogTerm(); }
 
+    /** 当前快照边界（lastIncludedIndex）：已压缩进快照的已提交下标。 */
+    public long getSnapshotIndex() { return snapshot.getLastIncludedIndex(); }
+
     /** 下标可能落在快照内或快照后日志中。 */
     private long termAt(long index) {
         if (index == 0) {
@@ -179,6 +187,12 @@ public class RaftNode {
 
     public String read(String key) {
         return stateMachine.get(key);
+    }
+
+    /** 测试/排障用：查询某幂等标识在本副本上的首次提交结论（未提交过返回 null）。 */
+    public String idempotentResult(String clientId, String requestId) {
+        IdempotencyRecord record = idempotency.get(dedupKey(clientId, requestId));
+        return record == null ? null : record.getResult();
     }
 
     public List<LogEntry> committedEntries() {
@@ -376,9 +390,8 @@ public class RaftNode {
         long next = nextIndex.getOrDefault(peer, lastLogIndex() + 1);
 
         if (next <= snapshotIndex) {
-            // 落后者需要快照；本实验在测试里通过更紧凑的日志窗口规避，做防御性拒绝提示。
-            System.out.printf("[复制] 节点 %s(领导) 发现 %s 落后于快照边界 %d，需要 InstallSnapshot（本实验不触发）%n",
-                    id, peer, snapshotIndex);
+            // 落后者的起点已被本机压缩：直接推送快照让其整体追赶
+            sendInstallSnapshot(peer);
             return;
         }
 
@@ -471,6 +484,108 @@ public class RaftNode {
                 new RaftMessage.AppendEntriesResponse(currentTerm, true, -1, lastLogIndex())));
     }
 
+    /** 向落后副本推送当前快照（含 KV 状态与幂等表），让其跨越已压缩的历史。 */
+    private void sendInstallSnapshot(String peer) {
+        System.out.printf("[追赶] 节点 %s(领导) 发现 %s 的 nextIndex=%d 不晚于快照边界 %d，改发 InstallSnapshot（快照至=%d/term=%d）%n",
+                id, peer, nextIndex.getOrDefault(peer, -1L),
+                snapshot.getLastIncludedIndex(), snapshot.getLastIncludedIndex(),
+                snapshot.getLastIncludedTerm());
+        outbox.addLast(new Envelope(peer, new RaftMessage.InstallSnapshot(
+                currentTerm, id, snapshot.getLastIncludedIndex(), snapshot.getLastIncludedTerm(),
+                snapshot.getKv(), snapshot.getIdempotency())));
+    }
+
+    private void handleInstallSnapshotResponse(RaftMessage.InstallSnapshotResponse response, String from) {
+        if (response.term() > currentTerm) {
+            stepDown(response.term());
+            return;
+        }
+        if (role != NodeRole.LEADER || response.term() != currentTerm) {
+            return;
+        }
+        if (!response.success()) {
+            return; // 对端任期更高时会通过 term 体现；此处无需重试，心跳会再触发
+        }
+        long snapshotIndex = snapshot.getLastIncludedIndex();
+        // 跟随者可能自报更新的日志末尾（它手上已有比快照更新的内容），直接跳过去
+        long peerMatch = Math.max(snapshotIndex, response.followerLastIndex());
+        matchIndex.put(from, Math.max(matchIndex.getOrDefault(from, 0L), peerMatch));
+        nextIndex.put(from, peerMatch + 1);
+        System.out.printf("[追赶] 节点 %s(领导) 确认 %s 已安装快照，nextIndex 推进到 %d，继续用 AppendEntries 补齐后续条目%n",
+                id, from, peerMatch + 1);
+        advanceLeaderCommit();
+        sendAppendEntries(from);
+    }
+
+    /**
+     * 跟随者安装领导者的快照：
+     * <ul>
+     *   <li>任期过旧直接拒绝；</li>
+     *   <li>快照不比本地已提交状态新（lastIncludedIndex &lt;= commitIndex）时<b>忽略内容</b>，
+     *       只回成功确认——本地已提交/已应用的更新状态绝不能被旧快照覆盖；</li>
+     *   <li>否则持久化快照、按边界对齐截断日志（边界条目任期一致则保留其后未提交后缀，
+     *       否则整段丢弃）、用快照重置状态机与幂等表，并把 commitIndex/lastApplied
+     *       推进到快照边界——快照内全是已提交内容，不存在"未提交先生效"。</li>
+     * </ul>
+     */
+    private void handleInstallSnapshot(RaftMessage.InstallSnapshot request, String from) {
+        if (request.term() < currentTerm) {
+            outbox.addLast(new Envelope(from,
+                    new RaftMessage.InstallSnapshotResponse(currentTerm, false, lastLogIndex())));
+            return;
+        }
+        if (request.term() > currentTerm) {
+            stepDown(request.term());
+        }
+        role = NodeRole.FOLLOWER;
+        leaderHint = request.leaderId();
+        resetElectionTimer();
+
+        long snapIndex = request.lastIncludedIndex();
+        if (snapIndex <= commitIndex) {
+            System.out.printf("[追赶] 节点 %s 收到 %s 的快照(至=%d)，但本地已提交到 %d，忽略旧快照内容，仅回确认%n",
+                    id, from, snapIndex, commitIndex);
+            outbox.addLast(new Envelope(from,
+                    new RaftMessage.InstallSnapshotResponse(currentTerm, true, lastLogIndex())));
+            return;
+        }
+
+        // 边界对齐：本地若在快照边界处有同任期条目，其后的未提交后缀仍然有效，予以保留
+        List<LogEntry> retained = new ArrayList<>();
+        LogEntry boundary = entryAt(snapIndex);
+        if (boundary != null && boundary.getTerm() == request.lastIncludedTerm()) {
+            for (LogEntry e : log) {
+                if (e.getIndex() > snapIndex) {
+                    retained.add(e);
+                }
+            }
+        } else if (!retained.isEmpty() || boundary != null) {
+            // 边界任期不一致：快照之后的本地条目与领导历史分歧，整段丢弃
+        }
+
+        Snapshot installed = new Snapshot(snapIndex, request.lastIncludedTerm(),
+                request.kv(), request.idempotency());
+        // 先落快照再截日志：崩溃于两者之间时，重启会以快照为准丢弃冗余旧日志，不丢已提交状态
+        storage.saveSnapshot(installed);
+        snapshot = installed;
+        log.clear();
+        log.addAll(retained);
+        storage.saveLog(log);
+
+        stateMachine.resetFrom(request.kv());
+        idempotency.clear();
+        idempotency.putAll(request.idempotency());
+        commitIndex = snapIndex;
+        lastApplied = snapIndex;
+        persistHardState();
+
+        System.out.printf("[追赶] 节点 %s 安装来自 %s 的快照：推进至 index=%d/term=%d，KV=%d 项，幂等表=%d 条，保留快照后日志 %d 条%n",
+                id, from, snapIndex, request.lastIncludedTerm(),
+                request.kv().size(), request.idempotency().size(), retained.size());
+        outbox.addLast(new Envelope(from,
+                new RaftMessage.InstallSnapshotResponse(currentTerm, true, lastLogIndex())));
+    }
+
     private void handleAppendEntriesResponse(RaftMessage.AppendEntriesResponse response, String from) {
         if (response.term() > currentTerm) {
             stepDown(response.term());
@@ -487,14 +602,13 @@ public class RaftNode {
             nextIndex.put(from, response.followerLastIndex() + 1);
             advanceLeaderCommit();
         } else {
-            long base = snapshot.getLastIncludedIndex() + 1;
-            // 跟随者自报其日志末尾：从末尾之后重发，配合 conflictHint 快速定位分歧
-            long byFollower = Math.max(base, response.followerLastIndex() + 1);
+            // 跟随者自报其日志末尾/冲突起点：nextIndex 允许退到快照边界以内，
+            // 下一步 sendAppendEntries 会据此改发 InstallSnapshot（落后太多的唯一追赶通道）
             long next;
             if (response.conflictHint() > 0) {
-                next = Math.max(base, Math.min(response.conflictHint(), byFollower));
+                next = Math.min(response.conflictHint(), response.followerLastIndex() + 1);
             } else {
-                next = byFollower;
+                next = response.followerLastIndex() + 1;
             }
             nextIndex.put(from, next);
             sendAppendEntries(from);
@@ -514,6 +628,10 @@ public class RaftNode {
                 handleAppendEntries(ae, from);
             } else if (message instanceof RaftMessage.AppendEntriesResponse aer) {
                 handleAppendEntriesResponse(aer, from);
+            } else if (message instanceof RaftMessage.InstallSnapshot is) {
+                handleInstallSnapshot(is, from);
+            } else if (message instanceof RaftMessage.InstallSnapshotResponse isr) {
+                handleInstallSnapshotResponse(isr, from);
             }
         }
     }

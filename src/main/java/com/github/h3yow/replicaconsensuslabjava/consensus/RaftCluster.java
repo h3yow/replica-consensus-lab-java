@@ -111,6 +111,14 @@ public class RaftCluster {
 
     // ---------- 故障与重启 ----------
 
+    /**
+     * 测试注入钩子：把一条消息直接塞进目标节点收件箱（绕过分区检查），
+     * 用于模拟真实网络中的延迟、重复或乱序投递（例如过期的 InstallSnapshot）。
+     */
+    public void inject(String fromId, String toId, Object message) {
+        nodes.get(toId).deliver(message, fromId);
+    }
+
     /** 宕机：节点停止一切活动；"磁盘"（storage）保留。 */
     public void crash(String id) {
         nodes.get(id).crash();
